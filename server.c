@@ -7,18 +7,17 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 
-#include <sys/wait.h>
-#include <signal.h>
-#include <unistd.h>
-#include <errno.h>
-
-#define PORT "3490"      // the port users will be connecting to
-#define BACKLOG 10       // how many pending connections queue will hold
-#define MAXDATASIZE 1024 // max number of bytes we can get at once 
+#define PORT "42000"
+#define BACKLOG 10
+#define BUFFER_SIZE 1024
 
 int main(void)
 {
-	int sock; // The socket file descriptor
+	// STEP 1: Initialize the master socket
+	// The master socket is the one that will listen on the public port
+	// and accept the new clients.
+	
+	int master;
 	
 	struct addrinfo hints; // Hints for getaddrinfo to fill the results
 	memset(&hints, 0, sizeof hints); // Ensure the struct is empty
@@ -36,22 +35,24 @@ int main(void)
 	struct addrinfo* p;
 	for(p = servinfo; p != NULL; p = p->ai_next) // Iterate over the list
 	{
-		sock = socket(p->ai_family, p->ai_socktype, p->ai_protocol); // Try initializing the socket
-		if(sock == -1)
+		master = socket(p->ai_family, p->ai_socktype, p->ai_protocol); // Try initializing the socket
+		if(master == -1)
 		{
+			perror("socket");
 			continue;
 		}
 
 		int yes = 1;
-		if(setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(int)) == -1) // Bust the "Address already in use" error message
+		if(setsockopt(master, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(int)) == -1) // Bust the "Address already in use" error message
 		{
 			perror("setsockopt");
 			exit(1);
 		}
 
-		if(bind(sock, p->ai_addr, p->ai_addrlen) == -1) // Try binding the socket to the port
+		if(bind(master, p->ai_addr, p->ai_addrlen) == -1) // Try binding the socket to the port
 		{
-			close(sock);
+			perror("bind");
+			close(master);
 			continue;
 		}
 
@@ -65,49 +66,100 @@ int main(void)
 	
 	freeaddrinfo(servinfo); // Clear the results of the getaddrinfo
 	
-	if(listen(sock, BACKLOG) == -1) // Start listening on the socket, allowing BACKLOG connections to wait in the queue
+	if(listen(master, BACKLOG) == -1) // Start listening on the socket, allowing BACKLOG connections to wait in the queue
 	{
 		perror("listen");
 		exit(EXIT_FAILURE);
 	}
-
-	while(1) // Loop to accept incomming connections
-	{
-		struct sockaddr_storage addr; // The client address
-		socklen_t sin_size = sizeof addr;
-		
-		int conn = accept(sock, (struct sockaddr *) &addr, &sin_size); // Accept a new connection
-		if(conn == -1) // In case of accept error
-		{
-			perror("accept");
-			continue;
-		}
-
-		if(!fork()) // Fork to handle the connection in a separate thread
-		{
-			close(sock); // The child doesn't need the listening socket
 	
-			while(1)
+	// STEP 2: Handle the clients in a non-blocking way
+	// This use a pool of connection, and the select() function that will
+	// wait until a socket is ready.
+	
+	fd_set pool_fds; // Will contain all sockets handled by the server. It's actually a bit array… don't try to look at it with the naked eye
+	fd_set read_fds; // Will contain the temporary list of sockets.
+	
+	FD_ZERO(&pool_fds); // Ensure the socket pool is empty
+	FD_ZERO(&read_fds); // Ensure the socket pool is empty
+	
+	FD_SET(master, &pool_fds); // Add the master socket to the pool
+	
+	int max_descriptor = master; // Keep track of the bigest descriptor
+
+	while(1) // Loop until the end of times
+	{
+		read_fds = pool_fds; // Copy the pool to prevent dumb errors
+		
+		if(select(max_descriptor + 1, &read_fds, NULL, NULL, NULL) ==  -1) // Wait for something to happen on any socket
+		{
+			perror("select");
+			exit(EXIT_FAILURE);
+		}
+		
+		int i;
+		for(i = 0; i <= max_descriptor; i++) // Loop on every descriptor (brutal and ugly… but I don't give a fuck for educationnal purposes)
+		{
+			if(!FD_ISSET(i, &read_fds)) // If the descriptor isn't in the pool, skip to the next
 			{
-				char buffer[MAXDATASIZE];
-				int n = recv(conn, buffer, MAXDATASIZE-1, 0);
-				if (n == -1) {
-					perror("recv");
-					exit(EXIT_FAILURE);
-				}
-				
-				if(send(conn, buffer, n, 0) == -1)
-				{
-					perror("send");
-					exit(EXIT_FAILURE);
-				}
+				continue;
 			}
 			
-			close(conn); // Close the connection
-			exit(EXIT_SUCCESS); // Exit
+			if(i == master) // If the active descriptor is the master, this is a new client trying to connect
+			{
+				int conn = accept(master, NULL, NULL); // Accept the new connection
+				if(conn == -1) // In case of error, skip
+				{
+					perror("accept");
+					continue;
+				}
+				
+				FD_SET(conn, &pool_fds); // Add the new connection to the pool
+				if(conn > max_descriptor) // Update the bigest descriptor
+				{
+					max_descriptor = conn;
+				}
+				
+				continue;
+			}
+			
+			char buffer[BUFFER_SIZE]; // Initialize the buffer
+			int n = recv(i, buffer, sizeof buffer, 0); // Read from the socket
+			
+			if(n == 0) // If the receive returns a zero value, the connection was closed by the client
+			{
+				fprintf(stdout, "socket %d disconnected\n", i);
+				close(i); // Close the connection
+				FD_CLR(i, &pool_fds); // Remove it from the pool
+				continue;
+			}
+			
+			if(n < 0) // If the receive returns a negative value, it's an error
+			{
+				perror("recv");
+				close(i); // Close the connection
+				FD_CLR(i, &pool_fds); // Remove it from the pool
+				continue;
+			}
+			
+			int j;
+			for(j = 0; j <= max_descriptor; j++) // Iterate over each descriptor
+			{
+				if(!FD_ISSET(j, &pool_fds)) // Skip those that are not in the pool
+				{
+					continue;
+				}
+				
+				if(j == master || j == i) // Don't send to the master and the sender
+				{
+					continue;
+				}
+				
+				if(send(j, buffer, n, 0) == -1) // Notify about errors
+				{
+					perror("send");
+				}
+			}
 		}
-		
-		close(conn);  // The parent process doesn't need the connection socket
 	}
 	
 	return EXIT_SUCCESS;
